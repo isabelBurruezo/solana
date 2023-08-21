@@ -22,6 +22,9 @@ pub use {
     crate::legacy_contact_info::LegacyContactInfo, solana_client::connection_cache::Protocol,
 };
 
+pub const SOCKET_ADDR_UNSPECIFIED: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), /*port:*/ 0u16);
+
 const SOCKET_TAG_GOSSIP: u8 = 0;
 const SOCKET_TAG_REPAIR: u8 = 1;
 const SOCKET_TAG_RPC: u8 = 2;
@@ -64,7 +67,7 @@ pub enum Error {
     UnusedIpAddr(IpAddr),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, AbiExample, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ContactInfo {
     pubkey: Pubkey,
     #[serde(with = "serde_varint")]
@@ -80,6 +83,8 @@ pub struct ContactInfo {
     // All sockets have a unique key and a valid IP address index.
     #[serde(with = "short_vec")]
     sockets: Vec<SocketEntry>,
+    #[serde(with = "short_vec")]
+    extensions: Vec<Extension>,
     #[serde(skip_serializing)]
     cache: [SocketAddr; SOCKET_CACHE_SIZE],
 }
@@ -91,6 +96,9 @@ struct SocketEntry {
     #[serde(with = "serde_varint")]
     offset: u16, // Port offset with respect to the previous entry.
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+enum Extension {}
 
 // As part of deserialization, self.addrs and self.sockets should be cross
 // verified and self.cache needs to be populated. This type serves as a
@@ -108,6 +116,8 @@ struct ContactInfoLite {
     addrs: Vec<IpAddr>,
     #[serde(with = "short_vec")]
     sockets: Vec<SocketEntry>,
+    #[serde(with = "short_vec")]
+    extensions: Vec<Extension>,
 }
 
 macro_rules! get_socket {
@@ -181,7 +191,8 @@ impl ContactInfo {
             version: solana_version::Version::default(),
             addrs: Vec::<IpAddr>::default(),
             sockets: Vec::<SocketEntry>::default(),
-            cache: [socket_addr_unspecified(); SOCKET_CACHE_SIZE],
+            extensions: Vec::<Extension>::default(),
+            cache: [SOCKET_ADDR_UNSPECIFIED; SOCKET_CACHE_SIZE],
         }
     }
 
@@ -329,7 +340,7 @@ impl ContactInfo {
             }
             self.maybe_remove_addr(entry.index);
             if let Some(entry) = self.cache.get_mut(usize::from(key)) {
-                *entry = socket_addr_unspecified();
+                *entry = SOCKET_ADDR_UNSPECIFIED;
             }
         }
     }
@@ -415,6 +426,7 @@ impl TryFrom<ContactInfoLite> for ContactInfo {
             version,
             addrs,
             sockets,
+            extensions,
         } = node;
         sanitize_entries(&addrs, &sockets)?;
         let mut node = ContactInfo {
@@ -425,7 +437,8 @@ impl TryFrom<ContactInfoLite> for ContactInfo {
             version,
             addrs,
             sockets,
-            cache: [socket_addr_unspecified(); SOCKET_CACHE_SIZE],
+            extensions,
+            cache: [SOCKET_ADDR_UNSPECIFIED; SOCKET_CACHE_SIZE],
         };
         // Populate node.cache.
         let mut port = 0u16;
@@ -455,11 +468,6 @@ impl Sanitize for ContactInfo {
         }
         Ok(())
     }
-}
-
-// Workaround until feature(const_socketaddr) is stable.
-pub(crate) fn socket_addr_unspecified() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), /*port:*/ 0u16)
 }
 
 pub(crate) fn sanitize_socket(socket: &SocketAddr) -> Result<(), Error> {
@@ -545,6 +553,23 @@ pub(crate) fn get_quic_socket(socket: &SocketAddr) -> Result<SocketAddr, Error> 
             .checked_add(QUIC_PORT_OFFSET)
             .ok_or_else(|| Error::InvalidPort(socket.port()))?,
     ))
+}
+
+#[cfg(all(test, RUSTC_WITH_SPECIALIZATION))]
+impl solana_frozen_abi::abi_example::AbiExample for ContactInfo {
+    fn example() -> Self {
+        Self {
+            pubkey: Pubkey::example(),
+            wallclock: u64::example(),
+            outset: u64::example(),
+            shred_version: u16::example(),
+            version: solana_version::Version::example(),
+            addrs: Vec::<IpAddr>::example(),
+            sockets: Vec::<SocketEntry>::example(),
+            extensions: vec![],
+            cache: <[SocketAddr; SOCKET_CACHE_SIZE]>::example(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -686,7 +711,8 @@ mod tests {
             version: solana_version::Version::default(),
             addrs: Vec::default(),
             sockets: Vec::default(),
-            cache: [socket_addr_unspecified(); SOCKET_CACHE_SIZE],
+            extensions: Vec::default(),
+            cache: [SOCKET_ADDR_UNSPECIFIED; SOCKET_CACHE_SIZE],
         };
         let mut sockets = HashMap::<u8, SocketAddr>::new();
         for _ in 0..1 << 14 {
@@ -706,7 +732,7 @@ mod tests {
                 if usize::from(key) < SOCKET_CACHE_SIZE {
                     assert_eq!(
                         &node.cache[usize::from(key)],
-                        socket.unwrap_or(&socket_addr_unspecified())
+                        socket.unwrap_or(&SOCKET_ADDR_UNSPECIFIED)
                     )
                 }
             }

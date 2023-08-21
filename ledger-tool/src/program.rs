@@ -1,5 +1,5 @@
 use {
-    crate::{args::*, ledger_utils::*},
+    crate::{args::*, canonicalize_ledger_path, ledger_utils::*},
     clap::{value_t, App, AppSettings, Arg, ArgMatches, SubCommand},
     log::*,
     serde::{Deserialize, Serialize},
@@ -160,13 +160,11 @@ impl ProgramSubCommand for App<'_, '_> {
         .subcommand(
             SubCommand::with_name("cfg")
                 .about("generates Control Flow Graph of the program.")
-                .arg(&max_genesis_arg)
                 .arg(&program_arg)
         )
         .subcommand(
             SubCommand::with_name("disassemble")
                 .about("dumps disassembled code of the program.")
-                .arg(&max_genesis_arg)
                 .arg(&program_arg)
         )
         .subcommand(
@@ -433,7 +431,8 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
         ("run", Some(arg_matches)) => arg_matches,
         _ => unreachable!(),
     };
-    let bank = load_blockstore(ledger_path, matches);
+    let ledger_path = canonicalize_ledger_path(ledger_path);
+    let bank = load_blockstore(&ledger_path, matches);
     let loader_id = bpf_loader_upgradeable::id();
     let mut transaction_accounts = Vec::new();
     let mut instruction_accounts = Vec::new();
@@ -579,17 +578,17 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
     if matches.value_of("mode").unwrap() == "debugger" {
         vm.debug_port = Some(matches.value_of("port").unwrap().parse::<u16>().unwrap());
     }
-    let (instruction_count, result) = vm.execute_program(interpreted);
+    let (instruction_count, result) = vm.execute_program(&verified_executable, interpreted);
     let duration = Instant::now() - start_time;
     if matches.occurrences_of("trace") > 0 {
         // top level trace is stored in syscall_context
-        if let Some(Some(syscall_context)) = vm.env.context_object_pointer.syscall_context.last() {
+        if let Some(Some(syscall_context)) = vm.context_object_pointer.syscall_context.last() {
             let trace = syscall_context.trace_log.as_slice();
             output_trace(matches, trace, 0, &mut analysis);
         }
         // the remaining traces are saved in InvokeContext when
         // corresponding syscall_contexts are popped
-        let traces = vm.env.context_object_pointer.get_traces();
+        let traces = vm.context_object_pointer.get_traces();
         for (frame, trace) in traces.iter().filter(|t| !t.is_empty()).enumerate() {
             output_trace(matches, trace, frame + 1, &mut analysis);
         }

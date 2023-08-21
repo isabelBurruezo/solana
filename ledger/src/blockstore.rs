@@ -135,6 +135,11 @@ impl std::fmt::Display for InsertDataShredError {
     }
 }
 
+pub struct InsertResults {
+    completed_data_set_infos: Vec<CompletedDataSetInfo>,
+    duplicate_shreds: Vec<Shred>,
+}
+
 /// A "complete data set" is a range of [`Shred`]s that combined in sequence carry a single
 /// serialized [`Vec<Entry>`].
 ///
@@ -817,20 +822,16 @@ impl Blockstore {
     /// On success, the function returns an Ok result with a vector of
     /// `CompletedDataSetInfo` and a vector of its corresponding index in the
     /// input `shreds` vector.
-    pub fn insert_shreds_handle_duplicate<F>(
+    fn do_insert_shreds(
         &self,
         shreds: Vec<Shred>,
         is_repaired: Vec<bool>,
         leader_schedule: Option<&LeaderScheduleCache>,
         is_trusted: bool,
         retransmit_sender: Option<&Sender<Vec</*shred:*/ Vec<u8>>>>,
-        handle_duplicate: &F,
         reed_solomon_cache: &ReedSolomonCache,
         metrics: &mut BlockstoreInsertionMetrics,
-    ) -> Result<Vec<CompletedDataSetInfo>>
-    where
-        F: Fn(Shred),
-    {
+    ) -> Result<InsertResults> {
         assert_eq!(shreds.len(), is_repaired.len());
         let mut total_start = Measure::start("Total elapsed");
         let mut start = Measure::start("Blockstore lock");
@@ -845,6 +846,7 @@ impl Blockstore {
         let mut erasure_metas = HashMap::new();
         let mut slot_meta_working_set = HashMap::new();
         let mut index_working_set = HashMap::new();
+        let mut duplicate_shreds = vec![];
 
         metrics.num_shreds += shreds.len();
         let mut start = Measure::start("Shred insertion");
@@ -867,7 +869,7 @@ impl Blockstore {
                         &mut just_inserted_shreds,
                         &mut index_meta_time_us,
                         is_trusted,
-                        handle_duplicate,
+                        &mut duplicate_shreds,
                         leader_schedule,
                         shred_source,
                     ) {
@@ -902,7 +904,7 @@ impl Blockstore {
                         &mut write_batch,
                         &mut just_inserted_shreds,
                         &mut index_meta_time_us,
-                        handle_duplicate,
+                        &mut duplicate_shreds,
                         is_trusted,
                         shred_source,
                         metrics,
@@ -951,7 +953,7 @@ impl Blockstore {
                         &mut just_inserted_shreds,
                         &mut index_meta_time_us,
                         is_trusted,
-                        &handle_duplicate,
+                        &mut duplicate_shreds,
                         leader_schedule,
                         ShredSource::Recovered,
                     ) {
@@ -1035,7 +1037,44 @@ impl Blockstore {
         metrics.total_elapsed_us += total_start.as_us();
         metrics.index_meta_time_us += index_meta_time_us;
 
-        Ok(newly_completed_data_sets)
+        Ok(InsertResults {
+            completed_data_set_infos: newly_completed_data_sets,
+            duplicate_shreds,
+        })
+    }
+
+    pub fn insert_shreds_handle_duplicate<F>(
+        &self,
+        shreds: Vec<Shred>,
+        is_repaired: Vec<bool>,
+        leader_schedule: Option<&LeaderScheduleCache>,
+        is_trusted: bool,
+        retransmit_sender: Option<&Sender<Vec</*shred:*/ Vec<u8>>>>,
+        handle_duplicate: &F,
+        reed_solomon_cache: &ReedSolomonCache,
+        metrics: &mut BlockstoreInsertionMetrics,
+    ) -> Result<Vec<CompletedDataSetInfo>>
+    where
+        F: Fn(Shred),
+    {
+        let InsertResults {
+            completed_data_set_infos,
+            duplicate_shreds,
+        } = self.do_insert_shreds(
+            shreds,
+            is_repaired,
+            leader_schedule,
+            is_trusted,
+            retransmit_sender,
+            reed_solomon_cache,
+            metrics,
+        )?;
+
+        for shred in duplicate_shreds {
+            handle_duplicate(shred);
+        }
+
+        Ok(completed_data_set_infos)
     }
 
     pub fn add_new_shred_signal(&self, s: Sender<bool>) {
@@ -1113,20 +1152,20 @@ impl Blockstore {
         is_trusted: bool,
     ) -> Result<Vec<CompletedDataSetInfo>> {
         let shreds_len = shreds.len();
-        self.insert_shreds_handle_duplicate(
+        let insert_results = self.do_insert_shreds(
             shreds,
             vec![false; shreds_len],
             leader_schedule,
             is_trusted,
-            None,    // retransmit-sender
-            &|_| {}, // handle-duplicates
+            None, // retransmit-sender
             &ReedSolomonCache::default(),
             &mut BlockstoreInsertionMetrics::default(),
-        )
+        )?;
+        Ok(insert_results.completed_data_set_infos)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn check_insert_coding_shred<F>(
+    fn check_insert_coding_shred(
         &self,
         shred: Shred,
         erasure_metas: &mut HashMap<ErasureSetId, ErasureMeta>,
@@ -1134,14 +1173,11 @@ impl Blockstore {
         write_batch: &mut WriteBatch,
         just_received_shreds: &mut HashMap<ShredId, Shred>,
         index_meta_time_us: &mut u64,
-        handle_duplicate: &F,
+        duplicate_shreds: &mut Vec<Shred>,
         is_trusted: bool,
         shred_source: ShredSource,
         metrics: &mut BlockstoreInsertionMetrics,
-    ) -> bool
-    where
-        F: Fn(Shred),
-    {
+    ) -> bool {
         let slot = shred.slot();
         let shred_index = u64::from(shred.index());
 
@@ -1156,7 +1192,7 @@ impl Blockstore {
         if !is_trusted {
             if index_meta.coding().contains(shred_index) {
                 metrics.num_coding_shreds_exists += 1;
-                handle_duplicate(shred);
+                duplicate_shreds.push(shred);
                 return false;
             }
 
@@ -1300,7 +1336,7 @@ impl Blockstore {
     ///     whether it is okay to insert the input shred.
     /// - `shred_source`: the source of the shred.
     #[allow(clippy::too_many_arguments)]
-    fn check_insert_data_shred<F>(
+    fn check_insert_data_shred(
         &self,
         shred: Shred,
         erasure_metas: &mut HashMap<ErasureSetId, ErasureMeta>,
@@ -1310,13 +1346,10 @@ impl Blockstore {
         just_inserted_shreds: &mut HashMap<ShredId, Shred>,
         index_meta_time_us: &mut u64,
         is_trusted: bool,
-        handle_duplicate: &F,
+        duplicate_shreds: &mut Vec<Shred>,
         leader_schedule: Option<&LeaderScheduleCache>,
         shred_source: ShredSource,
-    ) -> std::result::Result<Vec<CompletedDataSetInfo>, InsertDataShredError>
-    where
-        F: Fn(Shred),
-    {
+    ) -> std::result::Result<Vec<CompletedDataSetInfo>, InsertDataShredError> {
         let slot = shred.slot();
         let shred_index = u64::from(shred.index());
 
@@ -1337,7 +1370,7 @@ impl Blockstore {
 
         if !is_trusted {
             if Self::is_data_shred_present(&shred, slot_meta, index_meta.data()) {
-                handle_duplicate(shred);
+                duplicate_shreds.push(shred);
                 return Err(InsertDataShredError::Exists);
             }
 
@@ -3110,6 +3143,15 @@ impl Blockstore {
         self.optimistic_slots_cf.put(slot, &slot_data)
     }
 
+    /// Returns information about a single optimistically confirmed slot
+    pub fn get_optimistic_slot(&self, slot: Slot) -> Result<Option<(Hash, UnixTimestamp)>> {
+        Ok(self
+            .optimistic_slots_cf
+            .get(slot)?
+            .map(|meta| (meta.hash(), meta.timestamp())))
+    }
+
+    /// Returns information about the `num` latest optimistically confirmed slot
     pub fn get_latest_optimistic_slots(
         &self,
         num: usize,
@@ -6027,7 +6069,8 @@ pub mod tests {
         let gap: u64 = 10;
         assert!(gap > 3);
         // Create enough entries to ensure there are at least two shreds created
-        let num_entries = max_ticks_per_n_shreds(1, None) + 1;
+        let data_buffer_size = ShredData::capacity(/*merkle_proof_size:*/ None).unwrap();
+        let num_entries = max_ticks_per_n_shreds(1, Some(data_buffer_size)) + 1;
         let entries = create_ticks(num_entries, 0, Hash::default());
         let mut shreds =
             entries_to_test_shreds(&entries, slot, 0, true, 0, /*merkle_variant:*/ false);
@@ -6499,32 +6542,27 @@ pub mod tests {
             &mut write_batch,
             &mut just_received_shreds,
             &mut index_meta_time_us,
-            &|_shred| {
-                panic!("no dupes");
-            },
+            &mut vec![],
             false,
             ShredSource::Turbine,
             &mut BlockstoreInsertionMetrics::default(),
         ));
 
         // insert again fails on dupe
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let counter = AtomicUsize::new(0);
+        let mut duplicate_shreds = vec![];
         assert!(!blockstore.check_insert_coding_shred(
-            coding_shred,
+            coding_shred.clone(),
             &mut erasure_metas,
             &mut index_working_set,
             &mut write_batch,
             &mut just_received_shreds,
             &mut index_meta_time_us,
-            &|_shred| {
-                counter.fetch_add(1, Ordering::Relaxed);
-            },
+            &mut duplicate_shreds,
             false,
             ShredSource::Turbine,
             &mut BlockstoreInsertionMetrics::default(),
         ));
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(duplicate_shreds, vec![coding_shred]);
     }
 
     #[test]
@@ -7196,7 +7234,7 @@ pub mod tests {
         }
         .into();
         assert!(transaction_status_cf
-            .put_protobuf((0, Signature::new(&[2u8; 64]), 9), &status,)
+            .put_protobuf((0, Signature::from([2u8; 64]), 9), &status,)
             .is_ok());
 
         // result found
@@ -7216,7 +7254,7 @@ pub mod tests {
         } = transaction_status_cf
             .get_protobuf_or_bincode::<StoredTransactionStatusMeta>((
                 0,
-                Signature::new(&[2u8; 64]),
+                Signature::from([2u8; 64]),
                 9,
             ))
             .unwrap()
@@ -7253,11 +7291,11 @@ pub mod tests {
         assert!(transaction_status_index_cf.get(1).unwrap().is_some());
 
         for _ in 0..5 {
-            let random_bytes: Vec<u8> = (0..64).map(|_| rand::random::<u8>()).collect();
+            let random_bytes: [u8; 64] = std::array::from_fn(|_| rand::random::<u8>());
             blockstore
                 .write_transaction_status(
                     slot0,
-                    Signature::new(&random_bytes),
+                    Signature::from(random_bytes),
                     vec![&Pubkey::try_from(&random_bytes[..32]).unwrap()],
                     vec![&Pubkey::try_from(&random_bytes[32..]).unwrap()],
                     TransactionStatusMeta::default(),
@@ -7319,11 +7357,11 @@ pub mod tests {
 
         let slot1 = 20;
         for _ in 0..5 {
-            let random_bytes: Vec<u8> = (0..64).map(|_| rand::random::<u8>()).collect();
+            let random_bytes: [u8; 64] = std::array::from_fn(|_| rand::random::<u8>());
             blockstore
                 .write_transaction_status(
                     slot1,
-                    Signature::new(&random_bytes),
+                    Signature::from(random_bytes),
                     vec![&Pubkey::try_from(&random_bytes[..32]).unwrap()],
                     vec![&Pubkey::try_from(&random_bytes[32..]).unwrap()],
                     TransactionStatusMeta::default(),
@@ -7470,13 +7508,13 @@ pub mod tests {
         }
         .into();
 
-        let signature1 = Signature::new(&[1u8; 64]);
-        let signature2 = Signature::new(&[2u8; 64]);
-        let signature3 = Signature::new(&[3u8; 64]);
-        let signature4 = Signature::new(&[4u8; 64]);
-        let signature5 = Signature::new(&[5u8; 64]);
-        let signature6 = Signature::new(&[6u8; 64]);
-        let signature7 = Signature::new(&[7u8; 64]);
+        let signature1 = Signature::from([1u8; 64]);
+        let signature2 = Signature::from([2u8; 64]);
+        let signature3 = Signature::from([3u8; 64]);
+        let signature4 = Signature::from([4u8; 64]);
+        let signature5 = Signature::from([5u8; 64]);
+        let signature6 = Signature::from([6u8; 64]);
+        let signature7 = Signature::from([7u8; 64]);
 
         // Insert slots with fork
         //   0 (root)
@@ -7664,8 +7702,8 @@ pub mod tests {
         }
         .into();
 
-        let signature1 = Signature::new(&[2u8; 64]);
-        let signature2 = Signature::new(&[3u8; 64]);
+        let signature1 = Signature::from([2u8; 64]);
+        let signature2 = Signature::from([3u8; 64]);
 
         // Insert rooted slots 0..=3 with no fork
         let meta0 = SlotMeta::new(0, Some(0));
@@ -8036,7 +8074,7 @@ pub mod tests {
 
         let slot0 = 10;
         for x in 1..5 {
-            let signature = Signature::new(&[x; 64]);
+            let signature = Signature::from([x; 64]);
             blockstore
                 .write_transaction_status(
                     slot0,
@@ -8049,7 +8087,7 @@ pub mod tests {
         }
         let slot1 = 20;
         for x in 5..9 {
-            let signature = Signature::new(&[x; 64]);
+            let signature = Signature::from([x; 64]);
             blockstore
                 .write_transaction_status(
                     slot1,
@@ -8067,7 +8105,7 @@ pub mod tests {
             .unwrap();
         assert_eq!(all0.len(), 8);
         for x in 1..9 {
-            let expected_signature = Signature::new(&[x; 64]);
+            let expected_signature = Signature::from([x; 64]);
             assert_eq!(all0[x as usize - 1], expected_signature);
         }
         assert_eq!(
@@ -8101,7 +8139,7 @@ pub mod tests {
             .unwrap();
         assert_eq!(all1.len(), 8);
         for x in 1..9 {
-            let expected_signature = Signature::new(&[x; 64]);
+            let expected_signature = Signature::from([x; 64]);
             assert_eq!(all1[x as usize - 1], expected_signature);
         }
 
@@ -8141,8 +8179,8 @@ pub mod tests {
 
         // Test sort, regardless of entry order or signature value
         for slot in (21..25).rev() {
-            let random_bytes: Vec<u8> = (0..64).map(|_| rand::random::<u8>()).collect();
-            let signature = Signature::new(&random_bytes);
+            let random_bytes: [u8; 64] = std::array::from_fn(|_| rand::random::<u8>());
+            let signature = Signature::from(random_bytes);
             blockstore
                 .write_transaction_status(
                     slot,
@@ -8171,7 +8209,7 @@ pub mod tests {
 
         let slot1 = 1;
         for x in 1..5 {
-            let signature = Signature::new(&[x; 64]);
+            let signature = Signature::from([x; 64]);
             blockstore
                 .write_transaction_status(
                     slot1,
@@ -8184,7 +8222,7 @@ pub mod tests {
         }
         let slot2 = 2;
         for x in 5..7 {
-            let signature = Signature::new(&[x; 64]);
+            let signature = Signature::from([x; 64]);
             blockstore
                 .write_transaction_status(
                     slot2,
@@ -8196,7 +8234,7 @@ pub mod tests {
                 .unwrap();
         }
         for x in 7..9 {
-            let signature = Signature::new(&[x; 64]);
+            let signature = Signature::from([x; 64]);
             blockstore
                 .write_transaction_status(
                     slot2,
@@ -8209,7 +8247,7 @@ pub mod tests {
         }
         let slot3 = 3;
         for x in 9..13 {
-            let signature = Signature::new(&[x; 64]);
+            let signature = Signature::from([x; 64]);
             blockstore
                 .write_transaction_status(
                     slot3,
@@ -8227,7 +8265,7 @@ pub mod tests {
             .unwrap();
         for (i, (slot, signature)) in slot1_signatures.iter().enumerate() {
             assert_eq!(*slot, slot1);
-            assert_eq!(*signature, Signature::new(&[i as u8 + 1; 64]));
+            assert_eq!(*signature, Signature::from([i as u8 + 1; 64]));
         }
 
         let slot2_signatures = blockstore
@@ -8235,7 +8273,7 @@ pub mod tests {
             .unwrap();
         for (i, (slot, signature)) in slot2_signatures.iter().enumerate() {
             assert_eq!(*slot, slot2);
-            assert_eq!(*signature, Signature::new(&[i as u8 + 5; 64]));
+            assert_eq!(*signature, Signature::from([i as u8 + 5; 64]));
         }
 
         let slot3_signatures = blockstore
@@ -8243,7 +8281,7 @@ pub mod tests {
             .unwrap();
         for (i, (slot, signature)) in slot3_signatures.iter().enumerate() {
             assert_eq!(*slot, slot3);
-            assert_eq!(*signature, Signature::new(&[i as u8 + 9; 64]));
+            assert_eq!(*signature, Signature::from([i as u8 + 9; 64]));
         }
     }
 

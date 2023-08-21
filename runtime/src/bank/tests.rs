@@ -57,7 +57,7 @@ use {
         entrypoint::MAX_PERMITTED_DATA_INCREASE,
         epoch_schedule::{EpochSchedule, MINIMUM_SLOTS_PER_EPOCH},
         feature::{self, Feature},
-        feature_set::{self, reject_callx_r10, FeatureSet},
+        feature_set::{self, FeatureSet},
         fee::FeeStructure,
         fee_calculator::FeeRateGovernor,
         genesis_config::{create_genesis_config, ClusterType, GenesisConfig},
@@ -2134,9 +2134,6 @@ fn test_rent_eager_collect_rent_zero_lamport_deterministic() {
 #[test]
 fn test_bank_update_vote_stake_rewards() {
     let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
-    check_bank_update_vote_stake_rewards(|bank: &Bank| {
-        bank._load_vote_and_stake_accounts_with_thread_pool(&thread_pool, null_tracer())
-    });
     check_bank_update_vote_stake_rewards(|bank: &Bank| {
         bank._load_vote_and_stake_accounts(&thread_pool, null_tracer())
     });
@@ -4230,7 +4227,7 @@ fn test_bank_epoch_vote_accounts() {
         // epoch_stakes are a snapshot at the leader_schedule_slot_offset boundary
         //   in the prior epoch (0 in this case)
         assert_eq!(
-            leader_stake.stake(0, None),
+            leader_stake.stake(0, None, None),
             vote_accounts.unwrap().get(&leader_vote_account).unwrap().0
         );
 
@@ -4246,7 +4243,7 @@ fn test_bank_epoch_vote_accounts() {
 
     assert!(child.epoch_vote_accounts(epoch).is_some());
     assert_eq!(
-        leader_stake.stake(child.epoch(), None),
+        leader_stake.stake(child.epoch(), None, None),
         child
             .epoch_vote_accounts(epoch)
             .unwrap()
@@ -4264,7 +4261,7 @@ fn test_bank_epoch_vote_accounts() {
     );
     assert!(child.epoch_vote_accounts(epoch).is_some());
     assert_eq!(
-        leader_stake.stake(child.epoch(), None),
+        leader_stake.stake(child.epoch(), None, None),
         child
             .epoch_vote_accounts(epoch)
             .unwrap()
@@ -9261,12 +9258,6 @@ fn test_get_inflation_num_slots_already_activated() {
 #[test]
 fn test_stake_vote_account_validity() {
     let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
-    check_stake_vote_account_validity(
-        true, // check owner change,
-        |bank: &Bank| {
-            bank._load_vote_and_stake_accounts_with_thread_pool(&thread_pool, null_tracer())
-        },
-    );
     // TODO: stakes cache should be hardened for the case when the account
     // owner is changed from vote/stake program to something else. see:
     // https://github.com/solana-labs/solana/pull/24200#discussion_r849935444
@@ -9297,11 +9288,7 @@ where
         AccountSecondaryIndexes::default(),
         AccountShrinkThreshold::default(),
         false,
-        Some(AccountsDbConfig {
-            // at least one tests hit this assert, so disable it
-            assert_stakes_cache_consistency: false,
-            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
-        }),
+        Some(ACCOUNTS_DB_CONFIG_FOR_TESTING),
         None,
         &Arc::default(),
     ));
@@ -12112,7 +12099,6 @@ fn test_stake_account_consistency_with_rent_epoch_max_feature(
         Epoch::default()
     };
 
-    assert!(bank.rc.accounts.accounts_db.assert_stakes_cache_consistency);
     let mut pubkey_bytes_early = [0u8; 32];
     pubkey_bytes_early[31] = 2;
     let stake_id1 = Pubkey::from(pubkey_bytes_early);
@@ -12352,7 +12338,6 @@ fn test_runtime_feature_enable_with_program_cache() {
 
     // Execute before feature is enabled to get program into the cache.
     let result_without_feature_enabled = bank.process_transaction(&transaction1);
-    // Should fail when executing here
     assert_eq!(
         result_without_feature_enabled,
         Err(TransactionError::InstructionError(
@@ -12362,31 +12347,23 @@ fn test_runtime_feature_enable_with_program_cache() {
     );
 
     // Activate feature
-    bank.activate_feature(&reject_callx_r10::id());
+    let feature_account_balance =
+        std::cmp::max(genesis_config.rent.minimum_balance(Feature::size_of()), 1);
+    bank.store_account(
+        &feature_set::reject_callx_r10::id(),
+        &feature::create_account(&Feature { activated_at: None }, feature_account_balance),
+    );
+    bank.apply_feature_activations(ApplyFeatureActivationsCaller::NewFromParent, false);
 
-    // Execute after feature is enabled
+    // Execute after feature is enabled to check it was pruned and reverified.
     let result_with_feature_enabled = bank.process_transaction(&transaction2);
-    // Feature should have been activated thus causing the TX to fail at
-    // verification. It should fail here with new Executor Cache because feature
-    // activations should force the program to recompile with the new feature,
-    // and in this case the feature should cause the TX to fail at verification.
-    // Note: `ProgramFailedToComplete` error appearing again means the account
-    // was not recompiled by the cache upon feature activation and thus fails in
-    // the same way.
-    match &result_with_feature_enabled {
-        Err(x) => {
-            if *x
-                == TransactionError::InstructionError(0, InstructionError::ProgramFailedToComplete)
-            {
-                println!("ERROR: Program was not recompiled after runtime feature was enabled.");
-            }
-        }
-        Ok(_) => println!("ERROR: Program should fail during execution."),
-    }
-    // assert_eq!(
-    //     result_with_feature_enabled,
-    //     Err(TransactionError::InstructionError(0, InstructionError::InvalidAccountData))
-    // );
+    assert_eq!(
+        result_with_feature_enabled,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::InvalidAccountData
+        ))
+    );
 }
 
 #[test]

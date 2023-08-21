@@ -994,7 +994,7 @@ fn process_program_deploy(
         program_len * 2
     };
     let minimum_balance = rpc_client.get_minimum_balance_for_rent_exemption(
-        UpgradeableLoaderState::size_of_programdata(program_len),
+        UpgradeableLoaderState::size_of_programdata(programdata_len),
     )?;
 
     let result = if do_deploy {
@@ -2023,7 +2023,7 @@ fn read_and_verify_elf(program_location: &str) -> Result<Vec<u8>, Box<dyn std::e
 
     // Verify the program
     let program_runtime_environment = create_program_runtime_environment(
-        &FeatureSet::default(),
+        &FeatureSet::all_enabled(),
         &ComputeBudget::default(),
         true,
         false,
